@@ -569,7 +569,6 @@ export default function WaveTransformer() {
         if (!isNaN(l) && l <= 20) { totalLoss += l; count++; }
       }
       epochRef.current++;
-      if (epochRef.current % 300 === 0) wavesRef.current = generateWaves(30);
       const avgLoss = count > 0 ? totalLoss / count : null;
       if (avgLoss !== null) lossHistoryRef.current.push(avgLoss);
       setLoss(avgLoss);
