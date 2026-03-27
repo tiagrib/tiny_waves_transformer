@@ -318,6 +318,7 @@ export default function WaveTransformer() {
   const [isDrawing, setIsDrawing] = useState(false);
   const [renderTick, setRenderTick] = useState(0);
   const lossHistoryRef = useRef([]);
+  const [lr, setLr] = useState(0.03);
 
   // Init model
   useEffect(() => {
@@ -564,7 +565,7 @@ export default function WaveTransformer() {
       let totalLoss = 0, count = 0;
       for (let i = 0; i < 24; i++) {
         const { input, target } = sampleExample(waves);
-        const { loss: l } = trainStep(model, input, target, 0.03);
+        const { loss: l } = trainStep(model, input, target, lrRef.current);
         if (!isNaN(l) && l <= 20) { totalLoss += l; count++; }
       }
       epochRef.current++;
@@ -586,6 +587,8 @@ export default function WaveTransformer() {
   }, []);
 
   // Generation
+  const lrRef = useRef(lr);
+  lrRef.current = lr;
   const seedRef = useRef(seed);
   seedRef.current = seed;
 
@@ -771,6 +774,12 @@ export default function WaveTransformer() {
         <input type="range" min={8} max={48} value={seedSteps} onChange={e => setSeedSteps(+e.target.value)}
           disabled={phase !== 'DRAW'} style={{ width: 80 }} />
         <span>{seedSteps}</span>
+        <span style={{ color: '#888' }}>|</span>
+        <span>lr</span>
+        <input type="range" min={-3} max={-0.5} step={0.1} value={Math.log10(lr)}
+          onChange={e => setLr(Math.round(10 ** +e.target.value * 1000) / 1000)}
+          style={{ width: 60 }} />
+        <span>{lr}</span>
         <span style={{ color: '#888' }}>|</span>
         <span>ep {epoch}</span>
         <span>loss {loss !== null ? loss.toFixed(4) : '—'}</span>
