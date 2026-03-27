@@ -317,6 +317,7 @@ export default function WaveTransformer() {
   const [drawPoints, setDrawPoints] = useState([]);
   const [isDrawing, setIsDrawing] = useState(false);
   const [renderTick, setRenderTick] = useState(0);
+  const lossHistoryRef = useRef([]);
 
   // Init model
   useEffect(() => {
@@ -402,8 +403,9 @@ export default function WaveTransformer() {
     }
 
     if (phase === 'DRAW') {
-      // Raw stroke
+      const history = lossHistoryRef.current;
       if (drawPoints.length > 1) {
+        // Raw stroke
         ctx2d.strokeStyle = 'rgba(255,255,255,0.3)';
         ctx2d.lineWidth = 2;
         ctx2d.beginPath();
@@ -430,6 +432,62 @@ export default function WaveTransformer() {
             ctx2d.beginPath(); ctx2d.arc(x, y, 3, 0, 2 * Math.PI); ctx2d.fill();
           }
         }
+      } else if (history.length > 1) {
+        // Loss graph
+        const pad = { top: 16, bottom: 20, left: 44, right: 12 };
+        const gw = w - pad.left - pad.right, gh = h - pad.top - pad.bottom;
+        const maxLoss = Math.max(...history.slice(0, 20)); // scale from early peak
+        const minLoss = Math.min(...history);
+        const yRange = Math.max(maxLoss - minLoss, 0.01);
+
+        // Y-axis labels
+        ctx2d.fillStyle = '#666';
+        ctx2d.font = '10px monospace';
+        ctx2d.textAlign = 'right';
+        for (let i = 0; i <= 4; i++) {
+          const v = minLoss + (yRange * (4 - i)) / 4;
+          const y = pad.top + (i / 4) * gh;
+          ctx2d.fillText(v.toFixed(2), pad.left - 4, y + 3);
+          ctx2d.strokeStyle = 'rgba(255,255,255,0.06)';
+          ctx2d.lineWidth = 1;
+          ctx2d.beginPath(); ctx2d.moveTo(pad.left, y); ctx2d.lineTo(w - pad.right, y); ctx2d.stroke();
+        }
+
+        // X-axis label
+        ctx2d.fillStyle = '#666';
+        ctx2d.textAlign = 'center';
+        ctx2d.fillText('epoch ' + history.length, w / 2, h - 2);
+
+        // Loss curve
+        ctx2d.strokeStyle = '#f84';
+        ctx2d.lineWidth = 1.5;
+        ctx2d.beginPath();
+        for (let i = 0; i < history.length; i++) {
+          const x = pad.left + (i / (history.length - 1)) * gw;
+          const y = pad.top + ((maxLoss - history[i]) / yRange) * gh;
+          if (i === 0) ctx2d.moveTo(x, y); else ctx2d.lineTo(x, y);
+        }
+        ctx2d.stroke();
+
+        // Current loss label
+        ctx2d.fillStyle = '#f84';
+        ctx2d.textAlign = 'left';
+        ctx2d.font = '11px monospace';
+        ctx2d.fillText('loss ' + history[history.length - 1].toFixed(4), pad.left + 4, pad.top - 4);
+
+        // Prompt to draw
+        if (!isTraining) {
+          ctx2d.fillStyle = 'rgba(255,255,255,0.4)';
+          ctx2d.textAlign = 'center';
+          ctx2d.font = '13px monospace';
+          ctx2d.fillText('draw a seed wave ↑', w / 2, h / 2);
+        }
+      } else {
+        // No history, no drawing — prompt
+        ctx2d.fillStyle = 'rgba(255,255,255,0.3)';
+        ctx2d.textAlign = 'center';
+        ctx2d.font = '13px monospace';
+        ctx2d.fillText(isTraining ? 'training...' : 'draw a seed wave', w / 2, h / 2);
       }
     } else {
       // Show seed + generated
@@ -478,7 +536,7 @@ export default function WaveTransformer() {
         }
       }
     }
-  }, [phase, seed, generated, drawPoints, seedSteps, quantizeDraw]);
+  }, [phase, seed, generated, drawPoints, seedSteps, quantizeDraw, isTraining, epoch]);
 
   // Canvas resize
   useEffect(() => {
@@ -511,7 +569,9 @@ export default function WaveTransformer() {
       }
       epochRef.current++;
       if (epochRef.current % 300 === 0) wavesRef.current = generateWaves(30);
-      setLoss(count > 0 ? totalLoss / count : null);
+      const avgLoss = count > 0 ? totalLoss / count : null;
+      if (avgLoss !== null) lossHistoryRef.current.push(avgLoss);
+      setLoss(avgLoss);
       setEpoch(epochRef.current);
       setRenderTick(n => n + 1); // trigger texture re-render
     }, 50);
@@ -605,6 +665,7 @@ export default function WaveTransformer() {
     wavesRef.current = generateWaves(30);
     epochRef.current = 0;
     trailBufsRef.current = {};
+    lossHistoryRef.current = [];
     setSeed([]);
     setGenerated([]);
     setDrawPoints([]);
