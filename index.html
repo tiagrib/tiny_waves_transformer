@@ -522,7 +522,7 @@ const WaveTransformerComponent = function WaveTransformer() {
       let totalLoss = 0, count = 0;
       for (let i = 0; i < 24; i++) {
         const { input, target } = sampleExample(waves);
-        const { loss: l } = trainStep(model, input, target, 0.01);
+        const { loss: l } = trainStep(model, input, target, 0.03);
         if (!isNaN(l) && l <= 20) { totalLoss += l; count++; }
       }
       epochRef.current++;
@@ -542,22 +542,25 @@ const WaveTransformerComponent = function WaveTransformer() {
   }, []);
 
   // Generation
+  const seedRef = useRef(seed);
+  seedRef.current = seed;
+
   const generateOne = useCallback(() => {
     const model = modelRef.current;
     if (!model) return;
+    const currentSeed = seedRef.current;
     setGenerated(prev => {
-      const full = [...seed, ...prev];
+      const full = [...currentSeed, ...prev];
       const context = full.slice(-SEQ_LEN);
       const { probs, cache } = forward(model, context);
       const next = Array.from(probs).indexOf(Math.max(...probs));
-      // Store attention and FFN data for visualization
       lastAttnRef.current = cache.attnW;
       lastFfnActRef.current = cache.ffnAct;
       lastProbsRef.current = probs;
       return [...prev, next];
     });
     setRenderTick(n => n + 1);
-  }, [seed]);
+  }, []);
 
   const startPlaying = useCallback(() => {
     if (genIntervalRef.current) return;
