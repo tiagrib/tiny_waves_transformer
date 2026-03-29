@@ -275,8 +275,8 @@ function trainStep(model, adam, input, target, lr) {
 function generateWaves(count = 30) {
   const waves = [];
   for (let i = 0; i < count; i++) {
-    const freq = 0.04 + Math.random() * 0.3, amp = 2 + Math.random() * 5.5;
-    const phase = Math.random() * 2 * Math.PI, offset = 4 + Math.random() * 7;
+    const freq = 0.04 + Math.random() * 0.3, amp = 4 + Math.random() * 3.5;
+    const phase = Math.random() * 2 * Math.PI, offset = 5.5 + Math.random() * 4;
     const len = 60 + Math.floor(Math.random() * 41);
     const w = [];
     for (let t = 0; t < len; t++) w.push(Math.max(0, Math.min(15, Math.round(offset + amp * Math.sin(2 * Math.PI * freq * t + phase)))));
