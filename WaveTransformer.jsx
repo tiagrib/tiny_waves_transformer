@@ -2,9 +2,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 
 // === HYPERPARAMETERS ===
 const NUM_TOKENS = 16;
-const EMBED_DIM = 12;
 const SEQ_LEN = 24;
-const FFN_DIM = 36;
 
 // === LINEAR ALGEBRA ===
 function zeros(r, c) {
@@ -63,34 +61,44 @@ function geluDeriv(x) {
 }
 
 // === MODEL ===
-function createModel() {
+function createModel(dim) {
+  const ffnDim = dim * 3;
   return {
-    tok_emb: xavierInit(NUM_TOKENS, EMBED_DIM),
+    dim, ffnDim,
+    tok_emb: xavierInit(NUM_TOKENS, dim),
     pos_emb: (() => {
-      const m = xavierInit(SEQ_LEN, EMBED_DIM);
-      const base = Math.sqrt(2 / (SEQ_LEN + EMBED_DIM));
+      const m = xavierInit(SEQ_LEN, dim);
+      const base = Math.sqrt(2 / (SEQ_LEN + dim));
       for (let i = 0; i < SEQ_LEN; i++)
-        for (let j = 0; j < EMBED_DIM; j++) m[i][j] *= 0.1 / base;
+        for (let j = 0; j < dim; j++) m[i][j] *= 0.1 / base;
       return m;
     })(),
-    Wq: xavierInit(EMBED_DIM, EMBED_DIM),
-    Wk: xavierInit(EMBED_DIM, EMBED_DIM),
-    Wv: xavierInit(EMBED_DIM, EMBED_DIM),
-    Wo: xavierInit(EMBED_DIM, EMBED_DIM),
-    ffn_up: xavierInit(FFN_DIM, EMBED_DIM),
-    ffn_up_bias: new Float64Array(FFN_DIM),
-    ffn_down: xavierInit(EMBED_DIM, FFN_DIM),
-    ffn_down_bias: new Float64Array(EMBED_DIM),
-    out_proj: xavierInit(NUM_TOKENS, EMBED_DIM),
+    Wq: xavierInit(dim, dim),
+    Wk: xavierInit(dim, dim),
+    Wv: xavierInit(dim, dim),
+    Wo: xavierInit(dim, dim),
+    ffn_up: xavierInit(ffnDim, dim),
+    ffn_up_bias: new Float64Array(ffnDim),
+    ffn_down: xavierInit(dim, ffnDim),
+    ffn_down_bias: new Float64Array(dim),
+    out_proj: xavierInit(NUM_TOKENS, dim),
   };
 }
 
 const MAT_PARAMS = ['tok_emb','pos_emb','Wq','Wk','Wv','Wo','ffn_up','ffn_down','out_proj'];
 const BIAS_PARAMS = ['ffn_up_bias','ffn_down_bias'];
 
+function countParams(model) {
+  let n = 0;
+  for (const k of MAT_PARAMS) n += model[k].length * model[k][0].length;
+  for (const k of BIAS_PARAMS) n += model[k].length;
+  return n;
+}
+
 function forward(model, tokens) {
+  const { dim, ffnDim } = model;
   const T = tokens.length;
-  const sqrtD = Math.sqrt(EMBED_DIM);
+  const sqrtD = Math.sqrt(dim);
   const emb = [];
   for (let t = 0; t < T; t++) emb.push(vecAdd(model.tok_emb[tokens[t]], model.pos_emb[t]));
   const Q = [], K = [], V = [];
@@ -105,8 +113,8 @@ function forward(model, tokens) {
     for (let j = 0; j <= i; j++) sc[j] = dot(Q[i], K[j]) / sqrtD;
     const w = softmax(sc);
     attnW.push(w);
-    const c = new Float64Array(EMBED_DIM);
-    for (let j = 0; j <= i; j++) for (let d = 0; d < EMBED_DIM; d++) c[d] += w[j] * V[j][d];
+    const c = new Float64Array(dim);
+    for (let j = 0; j <= i; j++) for (let d = 0; d < dim; d++) c[d] += w[j] * V[j][d];
     ctx.push(c);
   }
   const attnOut = [], res1 = [];
@@ -119,115 +127,147 @@ function forward(model, tokens) {
   for (let t = 0; t < T; t++) {
     const pre = vecAdd(matVec(model.ffn_up, res1[t]), model.ffn_up_bias);
     ffnPre.push(pre);
-    const act = new Float64Array(FFN_DIM);
-    for (let j = 0; j < FFN_DIM; j++) act[j] = gelu(pre[j]);
+    const act = new Float64Array(ffnDim);
+    for (let j = 0; j < ffnDim; j++) act[j] = gelu(pre[j]);
     ffnAct.push(act);
     const out = vecAdd(matVec(model.ffn_down, act), model.ffn_down_bias);
     res2.push(vecAdd(res1[t], out));
   }
   const logits = matVec(model.out_proj, res2[T - 1]);
   const probs = softmax(logits);
-  return { probs, cache: { tokens, T, emb, Q, K, V, attnW, ctx, attnOut, res1, ffnPre, ffnAct, res2, logits } };
+  return { probs, logits, cache: { tokens, T, emb, Q, K, V, attnW, ctx, attnOut, res1, ffnPre, ffnAct, res2, logits } };
 }
 
 function backward(model, cache, target) {
+  const { dim, ffnDim } = model;
   const { tokens, T, emb, Q, K, V, attnW, ctx, attnOut, res1, ffnPre, ffnAct, res2, logits } = cache;
-  const sqrtD = Math.sqrt(EMBED_DIM);
+  const sqrtD = Math.sqrt(dim);
   const g = {
-    tok_emb: zeros(NUM_TOKENS, EMBED_DIM), pos_emb: zeros(SEQ_LEN, EMBED_DIM),
-    Wq: zeros(EMBED_DIM, EMBED_DIM), Wk: zeros(EMBED_DIM, EMBED_DIM),
-    Wv: zeros(EMBED_DIM, EMBED_DIM), Wo: zeros(EMBED_DIM, EMBED_DIM),
-    ffn_up: zeros(FFN_DIM, EMBED_DIM), ffn_up_bias: new Float64Array(FFN_DIM),
-    ffn_down: zeros(EMBED_DIM, FFN_DIM), ffn_down_bias: new Float64Array(EMBED_DIM),
-    out_proj: zeros(NUM_TOKENS, EMBED_DIM),
+    tok_emb: zeros(NUM_TOKENS, dim), pos_emb: zeros(SEQ_LEN, dim),
+    Wq: zeros(dim, dim), Wk: zeros(dim, dim),
+    Wv: zeros(dim, dim), Wo: zeros(dim, dim),
+    ffn_up: zeros(ffnDim, dim), ffn_up_bias: new Float64Array(ffnDim),
+    ffn_down: zeros(dim, ffnDim), ffn_down_bias: new Float64Array(dim),
+    out_proj: zeros(NUM_TOKENS, dim),
   };
   const probs = softmax(logits);
   const dL = new Float64Array(NUM_TOKENS);
   for (let i = 0; i < NUM_TOKENS; i++) dL[i] = probs[i] - (i === target ? 1 : 0);
 
   const dR2 = [];
-  for (let t = 0; t < T; t++) dR2.push(new Float64Array(EMBED_DIM));
+  for (let t = 0; t < T; t++) dR2.push(new Float64Array(dim));
   for (let i = 0; i < NUM_TOKENS; i++)
-    for (let j = 0; j < EMBED_DIM; j++) g.out_proj[i][j] = dL[i] * res2[T-1][j];
-  for (let j = 0; j < EMBED_DIM; j++)
+    for (let j = 0; j < dim; j++) g.out_proj[i][j] = dL[i] * res2[T-1][j];
+  for (let j = 0; j < dim; j++)
     for (let i = 0; i < NUM_TOKENS; i++) dR2[T-1][j] += model.out_proj[i][j] * dL[i];
 
   const dR1 = [];
-  for (let t = 0; t < T; t++) dR1.push(new Float64Array(EMBED_DIM));
+  for (let t = 0; t < T; t++) dR1.push(new Float64Array(dim));
   for (let t = 0; t < T; t++) {
     const dFO = new Float64Array(dR2[t]);
-    for (let j = 0; j < EMBED_DIM; j++) dR1[t][j] += dR2[t][j];
-    for (let j = 0; j < EMBED_DIM; j++) g.ffn_down_bias[j] += dFO[j];
-    const dFA = new Float64Array(FFN_DIM);
-    for (let i = 0; i < EMBED_DIM; i++)
-      for (let j = 0; j < FFN_DIM; j++) {
+    for (let j = 0; j < dim; j++) dR1[t][j] += dR2[t][j];
+    for (let j = 0; j < dim; j++) g.ffn_down_bias[j] += dFO[j];
+    const dFA = new Float64Array(ffnDim);
+    for (let i = 0; i < dim; i++)
+      for (let j = 0; j < ffnDim; j++) {
         g.ffn_down[i][j] += dFO[i] * ffnAct[t][j];
         dFA[j] += model.ffn_down[i][j] * dFO[i];
       }
-    const dFP = new Float64Array(FFN_DIM);
-    for (let j = 0; j < FFN_DIM; j++) dFP[j] = dFA[j] * geluDeriv(ffnPre[t][j]);
-    for (let j = 0; j < FFN_DIM; j++) g.ffn_up_bias[j] += dFP[j];
-    for (let i = 0; i < FFN_DIM; i++)
-      for (let j = 0; j < EMBED_DIM; j++) {
+    const dFP = new Float64Array(ffnDim);
+    for (let j = 0; j < ffnDim; j++) dFP[j] = dFA[j] * geluDeriv(ffnPre[t][j]);
+    for (let j = 0; j < ffnDim; j++) g.ffn_up_bias[j] += dFP[j];
+    for (let i = 0; i < ffnDim; i++)
+      for (let j = 0; j < dim; j++) {
         g.ffn_up[i][j] += dFP[i] * res1[t][j];
         dR1[t][j] += model.ffn_up[i][j] * dFP[i];
       }
   }
 
   const dEmb = [];
-  for (let t = 0; t < T; t++) dEmb.push(new Float64Array(EMBED_DIM));
+  for (let t = 0; t < T; t++) dEmb.push(new Float64Array(dim));
   const dAO = [];
   for (let t = 0; t < T; t++) {
     dAO.push(new Float64Array(dR1[t]));
-    for (let j = 0; j < EMBED_DIM; j++) dEmb[t][j] += dR1[t][j];
+    for (let j = 0; j < dim; j++) dEmb[t][j] += dR1[t][j];
   }
   const dCtx = [];
   for (let t = 0; t < T; t++) {
-    dCtx.push(new Float64Array(EMBED_DIM));
-    for (let i = 0; i < EMBED_DIM; i++)
-      for (let j = 0; j < EMBED_DIM; j++) {
+    dCtx.push(new Float64Array(dim));
+    for (let i = 0; i < dim; i++)
+      for (let j = 0; j < dim; j++) {
         g.Wo[i][j] += dAO[t][i] * ctx[t][j];
         dCtx[t][j] += model.Wo[i][j] * dAO[t][i];
       }
   }
   const dQ = [], dK = [], dV = [];
-  for (let t = 0; t < T; t++) { dQ.push(new Float64Array(EMBED_DIM)); dK.push(new Float64Array(EMBED_DIM)); dV.push(new Float64Array(EMBED_DIM)); }
+  for (let t = 0; t < T; t++) { dQ.push(new Float64Array(dim)); dK.push(new Float64Array(dim)); dV.push(new Float64Array(dim)); }
   for (let i = 0; i < T; i++) {
     const dW = new Float64Array(i + 1);
-    for (let j = 0; j <= i; j++) {
-      dW[j] = dot(dCtx[i], V[j]);
-      for (let d = 0; d < EMBED_DIM; d++) dV[j][d] += attnW[i][j] * dCtx[i][d];
-    }
-    let ws = 0;
-    for (let j = 0; j <= i; j++) ws += attnW[i][j] * dW[j];
-    for (let j = 0; j <= i; j++) {
-      const ds = attnW[i][j] * (dW[j] - ws) / sqrtD;
-      for (let d = 0; d < EMBED_DIM; d++) { dQ[i][d] += ds * K[j][d]; dK[j][d] += ds * Q[i][d]; }
-    }
+    for (let j = 0; j <= i; j++) { dW[j] = dot(dCtx[i], V[j]); for (let d = 0; d < dim; d++) dV[j][d] += attnW[i][j] * dCtx[i][d]; }
+    let ws = 0; for (let j = 0; j <= i; j++) ws += attnW[i][j] * dW[j];
+    for (let j = 0; j <= i; j++) { const ds = attnW[i][j] * (dW[j] - ws) / sqrtD; for (let d = 0; d < dim; d++) { dQ[i][d] += ds * K[j][d]; dK[j][d] += ds * Q[i][d]; } }
   }
   for (let t = 0; t < T; t++)
-    for (let i = 0; i < EMBED_DIM; i++)
-      for (let j = 0; j < EMBED_DIM; j++) {
+    for (let i = 0; i < dim; i++)
+      for (let j = 0; j < dim; j++) {
         g.Wq[i][j] += dQ[t][i] * emb[t][j]; g.Wk[i][j] += dK[t][i] * emb[t][j]; g.Wv[i][j] += dV[t][i] * emb[t][j];
         dEmb[t][j] += model.Wq[i][j] * dQ[t][i] + model.Wk[i][j] * dK[t][i] + model.Wv[i][j] * dV[t][i];
       }
   for (let t = 0; t < T; t++)
-    for (let d = 0; d < EMBED_DIM; d++) {
+    for (let d = 0; d < dim; d++) {
       g.tok_emb[tokens[t]][d] += dEmb[t][d];
       g.pos_emb[t][d] += dEmb[t][d];
     }
   return g;
 }
 
+// === ADAM OPTIMIZER ===
+function createAdam(model) {
+  const state = {};
+  for (const n of MAT_PARAMS) {
+    state[n] = { m: zeros(model[n].length, model[n][0].length), v: zeros(model[n].length, model[n][0].length) };
+  }
+  for (const n of BIAS_PARAMS) {
+    state[n] = { m: new Float64Array(model[n].length), v: new Float64Array(model[n].length) };
+  }
+  state.t = 0;
+  return state;
+}
+
 function clip(v) { return v > 5 ? 5 : v < -5 ? -5 : v; }
 
-function trainStep(model, input, target, lr) {
+function adamStep(model, grads, adam, lr, beta1, beta2, eps) {
+  beta1 = beta1 || 0.9; beta2 = beta2 || 0.999; eps = eps || 1e-8;
+  adam.t++;
+  const bc1 = 1 - Math.pow(beta1, adam.t);
+  const bc2 = 1 - Math.pow(beta2, adam.t);
+  for (const n of MAT_PARAMS) {
+    const p = model[n], g = grads[n], am = adam[n].m, av = adam[n].v;
+    for (let i = 0; i < p.length; i++)
+      for (let j = 0; j < p[i].length; j++) {
+        const gc = clip(g[i][j]);
+        am[i][j] = beta1 * am[i][j] + (1 - beta1) * gc;
+        av[i][j] = beta2 * av[i][j] + (1 - beta2) * gc * gc;
+        p[i][j] -= lr * (am[i][j] / bc1) / (Math.sqrt(av[i][j] / bc2) + eps);
+      }
+  }
+  for (const n of BIAS_PARAMS) {
+    const p = model[n], g = grads[n], am = adam[n].m, av = adam[n].v;
+    for (let i = 0; i < p.length; i++) {
+      const gc = clip(g[i]);
+      am[i] = beta1 * am[i] + (1 - beta1) * gc;
+      av[i] = beta2 * av[i] + (1 - beta2) * gc * gc;
+      p[i] -= lr * (am[i] / bc1) / (Math.sqrt(av[i] / bc2) + eps);
+    }
+  }
+}
+
+function trainStep(model, adam, input, target, lr) {
   const { probs, cache } = forward(model, input);
   const loss = -Math.log(Math.max(probs[target], 1e-12));
   if (loss > 20 || isNaN(loss)) return { loss, probs: null, cache: null };
   const g = backward(model, cache, target);
-  for (const n of MAT_PARAMS) { const m = model[n], gr = g[n]; for (let i = 0; i < m.length; i++) for (let j = 0; j < m[i].length; j++) m[i][j] -= lr * clip(gr[i][j]); }
-  for (const n of BIAS_PARAMS) { const b = model[n], gr = g[n]; for (let i = 0; i < b.length; i++) b[i] -= lr * clip(gr[i]); }
+  adamStep(model, g, adam, lr);
   return { loss, probs, cache };
 }
 
@@ -292,9 +332,26 @@ function renderTexture(canvas, data, rows, cols, trail, trailBuf) {
   ctx2d.putImageData(img, 0, 0);
 }
 
+// === TEMPERATURE SAMPLING ===
+function sampleWithTemp(logits, temp) {
+  if (temp <= 0.01) {
+    // Greedy
+    let best = 0;
+    for (let i = 1; i < logits.length; i++) if (logits[i] > logits[best]) best = i;
+    return best;
+  }
+  const scaled = new Float64Array(logits.length);
+  for (let i = 0; i < logits.length; i++) scaled[i] = logits[i] / temp;
+  const probs = softmax(scaled);
+  let r = Math.random(), cum = 0;
+  for (let i = 0; i < probs.length; i++) { cum += probs[i]; if (r < cum) return i; }
+  return probs.length - 1;
+}
+
 // === MAIN COMPONENT ===
 export default function WaveTransformer() {
   const modelRef = useRef(null);
+  const adamRef = useRef(null);
   const wavesRef = useRef(null);
   const epochRef = useRef(0);
   const trainIntervalRef = useRef(null);
@@ -318,15 +375,19 @@ export default function WaveTransformer() {
   const [isDrawing, setIsDrawing] = useState(false);
   const [renderTick, setRenderTick] = useState(0);
   const lossHistoryRef = useRef([]);
-  const [lr, setLr] = useState(0.03);
+  const [lr, setLr] = useState(0.001);
+  const [dim, setDim] = useState(24);
+  const [temp, setTemp] = useState(0.0);
+  const [paramCount, setParamCount] = useState(0);
 
   // Init model
   useEffect(() => {
-    modelRef.current = createModel();
+    const m = createModel(dim);
+    modelRef.current = m;
+    adamRef.current = createAdam(m);
     wavesRef.current = generateWaves(30);
-  }, []);
-
-  const getModel = useCallback(() => modelRef.current, []);
+    setParamCount(countParams(m));
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Drawing handlers
   const canvasToNorm = useCallback((canvas, e) => {
@@ -560,12 +621,13 @@ export default function WaveTransformer() {
     setIsTraining(true);
     trainIntervalRef.current = setInterval(() => {
       const model = modelRef.current;
+      const adam = adamRef.current;
       const waves = wavesRef.current;
-      if (!model || !waves) return;
+      if (!model || !adam || !waves) return;
       let totalLoss = 0, count = 0;
       for (let i = 0; i < 24; i++) {
         const { input, target } = sampleExample(waves);
-        const { loss: l } = trainStep(model, input, target, lrRef.current);
+        const { loss: l } = trainStep(model, adam, input, target, lrRef.current);
         if (!isNaN(l) && l <= 20) { totalLoss += l; count++; }
       }
       epochRef.current++;
@@ -573,7 +635,7 @@ export default function WaveTransformer() {
       if (avgLoss !== null) lossHistoryRef.current.push(avgLoss);
       setLoss(avgLoss);
       setEpoch(epochRef.current);
-      setRenderTick(n => n + 1); // trigger texture re-render
+      setRenderTick(n => n + 1);
     }, 50);
   }, []);
 
@@ -588,6 +650,8 @@ export default function WaveTransformer() {
   // Generation
   const lrRef = useRef(lr);
   lrRef.current = lr;
+  const tempRef = useRef(temp);
+  tempRef.current = temp;
   const seedRef = useRef(seed);
   seedRef.current = seed;
 
@@ -598,8 +662,8 @@ export default function WaveTransformer() {
     setGenerated(prev => {
       const full = [...currentSeed, ...prev];
       const context = full.slice(-SEQ_LEN);
-      const { probs, cache } = forward(model, context);
-      const next = Array.from(probs).indexOf(Math.max(...probs));
+      const { probs, logits, cache } = forward(model, context);
+      const next = sampleWithTemp(logits, tempRef.current);
       lastAttnRef.current = cache.attnW;
       lastFfnActRef.current = cache.ffnAct;
       lastProbsRef.current = probs;
@@ -663,7 +727,9 @@ export default function WaveTransformer() {
   const handleReset = useCallback(() => {
     stopPlaying();
     stopTraining();
-    modelRef.current = createModel();
+    const m = createModel(dim);
+    modelRef.current = m;
+    adamRef.current = createAdam(m);
     wavesRef.current = generateWaves(30);
     epochRef.current = 0;
     trailBufsRef.current = {};
@@ -673,11 +739,12 @@ export default function WaveTransformer() {
     setDrawPoints([]);
     setLoss(null);
     setEpoch(0);
+    setParamCount(countParams(m));
     lastAttnRef.current = null;
     lastFfnActRef.current = null;
     lastProbsRef.current = null;
     setPhase('DRAW');
-  }, [stopPlaying, stopTraining]);
+  }, [stopPlaying, stopTraining, dim]);
 
   // Cleanup
   useEffect(() => () => { stopPlaying(); stopTraining(); }, [stopPlaying, stopTraining]);
@@ -686,18 +753,18 @@ export default function WaveTransformer() {
   const textures = useMemo(() => {
     const m = modelRef.current;
     if (!m) return [];
+    const d = m.dim, fd = m.ffnDim;
     const list = [
-      { name: 'tok embed', data: m.tok_emb, rows: 16, cols: 12 },
-      { name: 'pos embed', data: m.pos_emb, rows: 24, cols: 12 },
-      { name: 'W_query', data: m.Wq, rows: 12, cols: 12 },
-      { name: 'W_key', data: m.Wk, rows: 12, cols: 12 },
-      { name: 'W_value', data: m.Wv, rows: 12, cols: 12 },
-      { name: 'W_out', data: m.Wo, rows: 12, cols: 12 },
-      { name: 'FFN ↑', data: m.ffn_up, rows: 36, cols: 12 },
-      { name: 'FFN ↓', data: m.ffn_down, rows: 12, cols: 36 },
-      { name: 'readout', data: m.out_proj, rows: 16, cols: 12 },
+      { name: 'tok embed', data: m.tok_emb, rows: 16, cols: d },
+      { name: 'pos embed', data: m.pos_emb, rows: 24, cols: d },
+      { name: 'W_query', data: m.Wq, rows: d, cols: d },
+      { name: 'W_key', data: m.Wk, rows: d, cols: d },
+      { name: 'W_value', data: m.Wv, rows: d, cols: d },
+      { name: 'W_out', data: m.Wo, rows: d, cols: d },
+      { name: 'FFN ↑', data: m.ffn_up, rows: fd, cols: d },
+      { name: 'FFN ↓', data: m.ffn_down, rows: d, cols: fd },
+      { name: 'readout', data: m.out_proj, rows: 16, cols: d },
     ];
-    // Dynamic textures during generation
     if (lastAttnRef.current && generated.length > 0) {
       const aw = lastAttnRef.current;
       const T = aw.length;
@@ -710,7 +777,8 @@ export default function WaveTransformer() {
       list.push({ name: 'attention', data: padded, rows: T, cols: T });
     }
     if (lastFfnActRef.current && generated.length > 0) {
-      list.push({ name: 'FFN act', data: lastFfnActRef.current, rows: lastFfnActRef.current.length, cols: 36 });
+      const fd2 = modelRef.current ? modelRef.current.ffnDim : 36;
+      list.push({ name: 'FFN act', data: lastFfnActRef.current, rows: lastFfnActRef.current.length, cols: fd2 });
     }
     return list;
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -743,7 +811,7 @@ export default function WaveTransformer() {
       {/* Header */}
       <div style={{ padding: '8px 12px', borderBottom: '1px solid #333', fontSize: 13, color: '#888' }}>
         <span style={{ color: '#eee', fontWeight: 700 }}>wave.transformer</span>
-        {' '}2,160 params · 16 levels · 12d
+        {' '}{paramCount.toLocaleString()} params · 16 levels · {dim}d
       </div>
 
       {/* Toolbar */}
@@ -763,7 +831,7 @@ export default function WaveTransformer() {
       </div>
 
       {/* Status bar */}
-      <div style={{ padding: '6px 12px', display: 'flex', gap: 12, alignItems: 'center', borderBottom: '1px solid #333', fontSize: 12, flexWrap: 'wrap' }}>
+      <div style={{ padding: '6px 12px', display: 'flex', gap: 10, alignItems: 'center', borderBottom: '1px solid #333', fontSize: 11, flexWrap: 'wrap' }}>
         <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
           <span style={{ width: 10, height: 10, borderRadius: '50%', border: '2px solid #888', background: trail ? '#4f4' : 'transparent', display: 'inline-block' }}
             onClick={() => setTrail(t => !t)} />
@@ -771,15 +839,28 @@ export default function WaveTransformer() {
         </label>
         <span>seed</span>
         <input type="range" min={8} max={48} value={seedSteps} onChange={e => setSeedSteps(+e.target.value)}
-          disabled={phase !== 'DRAW'} style={{ width: 80 }} />
+          disabled={phase !== 'DRAW'} style={{ width: 60 }} />
         <span>{seedSteps}</span>
-        <span style={{ color: '#888' }}>|</span>
+        <span style={{ color: '#555' }}>|</span>
+        <span>dim</span>
+        <input type="range" min={8} max={48} step={4} value={dim}
+          onChange={e => setDim(+e.target.value)}
+          disabled={isTraining || phase !== 'DRAW'}
+          style={{ width: 50 }} />
+        <span>{dim}</span>
+        <span style={{ color: '#555' }}>|</span>
         <span>lr</span>
-        <input type="range" min={-3} max={-0.5} step={0.1} value={Math.log10(lr)}
-          onChange={e => setLr(Math.round(10 ** +e.target.value * 1000) / 1000)}
-          style={{ width: 60 }} />
+        <input type="range" min={-4} max={-1} step={0.1} value={Math.log10(lr)}
+          onChange={e => setLr(Math.round(10 ** +e.target.value * 10000) / 10000)}
+          style={{ width: 50 }} />
         <span>{lr}</span>
-        <span style={{ color: '#888' }}>|</span>
+        <span style={{ color: '#555' }}>|</span>
+        <span>temp</span>
+        <input type="range" min={0} max={1.5} step={0.05} value={temp}
+          onChange={e => setTemp(+e.target.value)}
+          style={{ width: 50 }} />
+        <span>{temp.toFixed(2)}</span>
+        <span style={{ color: '#555' }}>|</span>
         <span>ep {epoch}</span>
         <span>loss {loss !== null ? loss.toFixed(4) : '—'}</span>
         <span>{generated.length} gen</span>
