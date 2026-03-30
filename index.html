@@ -82,7 +82,6 @@ function geluDerivative(x) {
 // Tiny Transformer — Model creation, forward pass, backward pass
 // Parameterized by config: { numTokens, seqLen, dim }
 
-}
 
 var MATRIX_PARAMS = ['tok_emb','pos_emb','Wq','Wk','Wv','Wo','ffn_up','ffn_down','out_proj'];
 var BIAS_PARAMS = ['ffn_up_bias','ffn_down_bias'];
@@ -269,7 +268,6 @@ function numericalGradient(model, input, target, paramName, i, j, epsilon) {
 // --- shared/optimizer.js ---
 // Tiny Transformer — Adam optimizer and training utilities
 
-}
 
 function createAdam(model) {
   var state = {};
@@ -323,7 +321,6 @@ function trainStep(model, adam, input, target, lr) {
 // --- shared/ui.js ---
 // Tiny Transformer — Shared UI helpers (heatmap, texture rendering, sampling)
 
-}
 
 function heatColor(v) {
   var t = (Math.max(-1, Math.min(1, v)) + 1) / 2;

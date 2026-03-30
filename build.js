@@ -15,9 +15,9 @@ if (!fs.existsSync(demoDir)) {
 const sharedFiles = ['core.js', 'model.js', 'optimizer.js', 'ui.js'];
 const sharedCode = sharedFiles.map(f => {
   let code = fs.readFileSync(path.join('shared', f), 'utf8');
-  // Strip Node.js require/exports for browser
-  code = code.replace(/^if \(typeof require.*\n(.*var.*require.*\n)*/gm, '');
-  code = code.replace(/^if \(typeof module.*$/gm, '');
+  // Strip Node.js require/exports blocks for browser
+  code = code.replace(/if \(typeof require[\s\S]*?\n\}\n?/g, '');
+  code = code.replace(/if \(typeof module[^\n]*\n?/g, '');
   return '// --- shared/' + f + ' ---\n' + code.trim();
 }).join('\n\n');
 
