@@ -1,50 +1,47 @@
 // Build script: generates standalone HTML from shared core + demo files
-// Usage: node build.js [demo-name]  (default: waves)
+// Usage: node build.js [demo-name|all]  (default: all)
 const fs = require('fs');
 const path = require('path');
 
-const demo = process.argv[2] || 'waves';
-const demoDir = path.join('demos', demo);
-
-if (!fs.existsSync(demoDir)) {
-  console.error('Demo not found: ' + demoDir);
-  process.exit(1);
-}
+const arg = process.argv[2] || 'all';
 
 // Read shared modules (order matters)
 const sharedFiles = ['core.js', 'model.js', 'optimizer.js', 'ui.js'];
-const sharedCode = sharedFiles.map(f => {
-  let code = fs.readFileSync(path.join('shared', f), 'utf8');
-  // Strip Node.js require/exports blocks for browser
-  code = code.replace(/if \(typeof require[\s\S]*?\n\}\n?/g, '');
-  code = code.replace(/if \(typeof module[^\n]*\n?/g, '');
-  return '// --- shared/' + f + ' ---\n' + code.trim();
-}).join('\n\n');
-
-// Read demo-specific data.js
-let dataCode = '';
-const dataPath = path.join(demoDir, 'data.js');
-if (fs.existsSync(dataPath)) {
-  dataCode = fs.readFileSync(dataPath, 'utf8');
-  dataCode = dataCode.replace(/^if \(typeof module.*$/gm, '');
-  dataCode = '// --- ' + demo + '/data.js ---\n' + dataCode.trim();
+function getSharedCode() {
+  return sharedFiles.map(f => {
+    let code = fs.readFileSync(path.join('shared', f), 'utf8');
+    code = code.replace(/if \(typeof require[\s\S]*?\n\}\n?/g, '');
+    code = code.replace(/if \(typeof module[^\n]*\n?/g, '');
+    return '// --- shared/' + f + ' ---\n' + code.trim();
+  }).join('\n\n');
 }
 
-// Read demo JSX
-const jsxFiles = fs.readdirSync(demoDir).filter(f => f.endsWith('.jsx'));
-if (jsxFiles.length === 0) { console.error('No .jsx file found in ' + demoDir); process.exit(1); }
-let jsxCode = fs.readFileSync(path.join(demoDir, jsxFiles[0]), 'utf8');
-// Strip import/export lines
-jsxCode = jsxCode.replace(/^import .*$/gm, '');
-jsxCode = jsxCode.replace(/^export default /gm, '');
-// Find the component function name
-const match = jsxCode.match(/^function\s+(\w+)/m);
-const componentName = match ? match[1] : 'App';
+function buildDemo(demo) {
+  const demoDir = path.join('demos', demo);
+  if (!fs.existsSync(demoDir)) { console.error('Demo not found: ' + demoDir); return false; }
 
-// Build title from demo name
-const title = demo.charAt(0).toUpperCase() + demo.slice(1) + ' Transformer';
+  const sharedCode = getSharedCode();
 
-const html = `<!DOCTYPE html>
+  // Read demo-specific data.js
+  let dataCode = '';
+  const dataPath = path.join(demoDir, 'data.js');
+  if (fs.existsSync(dataPath)) {
+    dataCode = fs.readFileSync(dataPath, 'utf8');
+    dataCode = dataCode.replace(/if \(typeof module[^\n]*\n?/g, '');
+    dataCode = '// --- ' + demo + '/data.js ---\n' + dataCode.trim();
+  }
+
+  // Read demo JSX
+  const jsxFiles = fs.readdirSync(demoDir).filter(f => f.endsWith('.jsx'));
+  if (jsxFiles.length === 0) { console.error('No .jsx file in ' + demoDir); return false; }
+  let jsxCode = fs.readFileSync(path.join(demoDir, jsxFiles[0]), 'utf8');
+  jsxCode = jsxCode.replace(/^import .*$/gm, '');
+  jsxCode = jsxCode.replace(/^export default /gm, '');
+  const match = jsxCode.match(/^function\s+(\w+)/m);
+  const componentName = match ? match[1] : 'App';
+  const title = demo.charAt(0).toUpperCase() + demo.slice(1) + ' Transformer';
+
+  const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -71,14 +68,34 @@ ${jsxCode.trim()}
 </body>
 </html>`;
 
-const outDir = path.join('dist', demo);
-if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
-const outPath = path.join(outDir, 'index.html');
-fs.writeFileSync(outPath, html);
-console.log('Built ' + outPath);
+  const outDir = path.join('dist', demo);
+  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(path.join(outDir, 'index.html'), html);
+  console.log('  Built dist/' + demo + '/index.html');
+  return true;
+}
 
-// Also write to root index.html for the default demo
-if (demo === 'waves') {
-  fs.writeFileSync('index.html', html);
-  console.log('Built index.html (root)');
+// Discover all demos (directories under demos/ that contain a .jsx file)
+function findDemos() {
+  return fs.readdirSync('demos').filter(d => {
+    const dir = path.join('demos', d);
+    return fs.statSync(dir).isDirectory() && fs.readdirSync(dir).some(f => f.endsWith('.jsx'));
+  });
+}
+
+if (arg === 'all') {
+  // Build landing page
+  const distDir = 'dist';
+  if (!fs.existsSync(distDir)) fs.mkdirSync(distDir, { recursive: true });
+  fs.copyFileSync(path.join('demos', 'index.html'), path.join(distDir, 'index.html'));
+  fs.copyFileSync(path.join('demos', 'index.html'), 'index.html');
+  console.log('  Built dist/index.html (landing page)');
+  console.log('  Built index.html (landing page)');
+
+  // Build each demo
+  const demos = findDemos();
+  for (const demo of demos) buildDemo(demo);
+  console.log('Done: ' + demos.length + ' demo(s) built');
+} else {
+  buildDemo(arg);
 }
