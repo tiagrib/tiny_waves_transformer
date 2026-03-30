@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Drums Transformer</title>
+  <style>* { margin: 0; padding: 0; box-sizing: border-box; } body { background: #0a0a0a; }</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script type="text/babel">
+// --- shared/core.js ---
+// Tiny Transformer — Core linear algebra and activations
+// Shared across all demos. No model knowledge here.
+
+function zeros(r, c) {
+  if (c === undefined) return new Float64Array(r);
+  const m = [];
+  for (let i = 0; i < r; i++) m.push(new Float64Array(c));
+  return m;
+}
+
+function xavierInit(r, c) {
+  const s = Math.sqrt(2 / (r + c));
+  const m = [];
+  for (let i = 0; i < r; i++) {
+    const row = new Float64Array(c);
+    for (let j = 0; j < c; j++) row[j] = (Math.random() * 2 - 1) * s;
+    m.push(row);
+  }
+  return m;
+}
+
+function matVec(mat, vec) {
+  const out = new Float64Array(mat.length);
+  for (let i = 0; i < mat.length; i++) {
+    let s = 0;
+    for (let j = 0; j < vec.length; j++) s += mat[i][j] * vec[j];
+    out[i] = s;
+  }
+  return out;
+}
+
+function vecAdd(a, b) {
+  const out = new Float64Array(a.length);
+  for (let i = 0; i < a.length; i++) out[i] = a[i] + b[i];
+  return out;
+}
+
+function dot(a, b) {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
+}
+
+function softmax(logits) {
+  let max = -Infinity;
+  for (let i = 0; i < logits.length; i++) if (logits[i] > max) max = logits[i];
+  const exps = new Float64Array(logits.length);
+  let sum = 0;
+  for (let i = 0; i < logits.length; i++) { exps[i] = Math.exp(logits[i] - max); sum += exps[i]; }
+  for (let i = 0; i < logits.length; i++) exps[i] /= sum;
+  return exps;
+}
+
+function gelu(x) {
+  const c = Math.sqrt(2 / Math.PI);
+  return 0.5 * x * (1 + Math.tanh(c * (x + 0.044715 * x * x * x)));
+}
+
+function geluDerivative(x) {
+  const c = Math.sqrt(2 / Math.PI);
+  const z = c * (x + 0.044715 * x * x * x);
+  const th = Math.tanh(z);
+  return 0.5 * (1 + th) + 0.5 * x * (1 - th * th) * c * (1 + 3 * 0.044715 * x * x);
+}
+
+// --- shared/model.js ---
+// Tiny Transformer — Model creation, forward pass, backward pass
+// Parameterized by config: { numTokens, seqLen, dim }
+
+
+var MATRIX_PARAMS = ['tok_emb','pos_emb','Wq','Wk','Wv','Wo','ffn_up','ffn_down','out_proj'];
+var BIAS_PARAMS = ['ffn_up_bias','ffn_down_bias'];
+
+function createModel(config) {
+  config = config || {};
+  var numTokens = config.numTokens || 16;
+  var seqLen = config.seqLen || 24;
+  var dim = config.dim || 24;
+  var ffnDim = dim * 3;
+  return {
+    numTokens: numTokens, seqLen: seqLen, dim: dim, ffnDim: ffnDim,
+    tok_emb: xavierInit(numTokens, dim),
+    pos_emb: (function() {
+      var m = xavierInit(seqLen, dim);
+      var base = Math.sqrt(2 / (seqLen + dim));
+      for (var i = 0; i < seqLen; i++)
+        for (var j = 0; j < dim; j++) m[i][j] *= 0.1 / base;
+      return m;
+    })(),
+    Wq: xavierInit(dim, dim),
+    Wk: xavierInit(dim, dim),
+    Wv: xavierInit(dim, dim),
+    Wo: xavierInit(dim, dim),
+    ffn_up: xavierInit(ffnDim, dim),
+    ffn_up_bias: new Float64Array(ffnDim),
+    ffn_down: xavierInit(dim, ffnDim),
+    ffn_down_bias: new Float64Array(dim),
+    out_proj: xavierInit(numTokens, dim),
+  };
+}
+
+function countParams(model) {
+  var n = 0;
+  for (var k of MATRIX_PARAMS) n += model[k].length * model[k][0].length;
+  for (var k of BIAS_PARAMS) n += model[k].length;
+  return n;
+}
+
+function forward(model, tokens) {
+  var numTokens = model.numTokens, dim = model.dim, ffnDim = model.ffnDim;
+  var T = tokens.length;
+  var sqrtD = Math.sqrt(dim);
+  var emb = [];
+  for (var t = 0; t < T; t++) emb.push(vecAdd(model.tok_emb[tokens[t]], model.pos_emb[t]));
+  var Q = [], K = [], V = [];
+  for (var t = 0; t < T; t++) {
+    Q.push(matVec(model.Wq, emb[t]));
+    K.push(matVec(model.Wk, emb[t]));
+    V.push(matVec(model.Wv, emb[t]));
+  }
+  var attnW = [], ctx = [];
+  for (var i = 0; i < T; i++) {
+    var sc = new Float64Array(i + 1);
+    for (var j = 0; j <= i; j++) sc[j] = dot(Q[i], K[j]) / sqrtD;
+    var w = softmax(sc);
+    attnW.push(w);
+    var c = new Float64Array(dim);
+    for (var j = 0; j <= i; j++) for (var d = 0; d < dim; d++) c[d] += w[j] * V[j][d];
+    ctx.push(c);
+  }
+  var attnOut = [], res1 = [];
+  for (var t = 0; t < T; t++) {
+    var ao = matVec(model.Wo, ctx[t]);
+    attnOut.push(ao);
+    res1.push(vecAdd(emb[t], ao));
+  }
+  var ffnPre = [], ffnAct = [], res2 = [];
+  for (var t = 0; t < T; t++) {
+    var pre = vecAdd(matVec(model.ffn_up, res1[t]), model.ffn_up_bias);
+    ffnPre.push(pre);
+    var act = new Float64Array(ffnDim);
+    for (var j = 0; j < ffnDim; j++) act[j] = gelu(pre[j]);
+    ffnAct.push(act);
+    var out = vecAdd(matVec(model.ffn_down, act), model.ffn_down_bias);
+    res2.push(vecAdd(res1[t], out));
+  }
+  var logits = matVec(model.out_proj, res2[T - 1]);
+  var probs = softmax(logits);
+  return { probs: probs, logits: logits, cache: { tokens: tokens, T: T, emb: emb, Q: Q, K: K, V: V, attnW: attnW, ctx: ctx, attnOut: attnOut, res1: res1, ffnPre: ffnPre, ffnAct: ffnAct, res2: res2, logits: logits } };
+}
+
+function backward(model, cache, target) {
+  var numTokens = model.numTokens, seqLen = model.seqLen, dim = model.dim, ffnDim = model.ffnDim;
+  var tokens = cache.tokens, T = cache.T, emb = cache.emb, Q = cache.Q, K = cache.K, V = cache.V;
+  var attnW = cache.attnW, ctx = cache.ctx, res1 = cache.res1, ffnPre = cache.ffnPre, ffnAct = cache.ffnAct, res2 = cache.res2, logits = cache.logits;
+  var sqrtD = Math.sqrt(dim);
+  var g = {
+    tok_emb: zeros(numTokens, dim), pos_emb: zeros(seqLen, dim),
+    Wq: zeros(dim, dim), Wk: zeros(dim, dim), Wv: zeros(dim, dim), Wo: zeros(dim, dim),
+    ffn_up: zeros(ffnDim, dim), ffn_up_bias: new Float64Array(ffnDim),
+    ffn_down: zeros(dim, ffnDim), ffn_down_bias: new Float64Array(dim),
+    out_proj: zeros(numTokens, dim),
+  };
+  var probs = softmax(logits);
+  var dL = new Float64Array(numTokens);
+  for (var i = 0; i < numTokens; i++) dL[i] = probs[i] - (i === target ? 1 : 0);
+
+  var dR2 = [];
+  for (var t = 0; t < T; t++) dR2.push(new Float64Array(dim));
+  for (var i = 0; i < numTokens; i++)
+    for (var j = 0; j < dim; j++) g.out_proj[i][j] = dL[i] * res2[T-1][j];
+  for (var j = 0; j < dim; j++)
+    for (var i = 0; i < numTokens; i++) dR2[T-1][j] += model.out_proj[i][j] * dL[i];
+
+  var dR1 = [];
+  for (var t = 0; t < T; t++) dR1.push(new Float64Array(dim));
+  for (var t = 0; t < T; t++) {
+    var dFO = new Float64Array(dR2[t]);
+    for (var j = 0; j < dim; j++) dR1[t][j] += dR2[t][j];
+    for (var j = 0; j < dim; j++) g.ffn_down_bias[j] += dFO[j];
+    var dFA = new Float64Array(ffnDim);
+    for (var i = 0; i < dim; i++)
+      for (var j = 0; j < ffnDim; j++) {
+        g.ffn_down[i][j] += dFO[i] * ffnAct[t][j];
+        dFA[j] += model.ffn_down[i][j] * dFO[i];
+      }
+    var dFP = new Float64Array(ffnDim);
+    for (var j = 0; j < ffnDim; j++) dFP[j] = dFA[j] * geluDerivative(ffnPre[t][j]);
+    for (var j = 0; j < ffnDim; j++) g.ffn_up_bias[j] += dFP[j];
+    for (var i = 0; i < ffnDim; i++)
+      for (var j = 0; j < dim; j++) {
+        g.ffn_up[i][j] += dFP[i] * res1[t][j];
+        dR1[t][j] += model.ffn_up[i][j] * dFP[i];
+      }
+  }
+
+  var dEmb = [];
+  for (var t = 0; t < T; t++) dEmb.push(new Float64Array(dim));
+  var dAO = [];
+  for (var t = 0; t < T; t++) {
+    dAO.push(new Float64Array(dR1[t]));
+    for (var j = 0; j < dim; j++) dEmb[t][j] += dR1[t][j];
+  }
+  var dCtx = [];
+  for (var t = 0; t < T; t++) {
+    dCtx.push(new Float64Array(dim));
+    for (var i = 0; i < dim; i++)
+      for (var j = 0; j < dim; j++) {
+        g.Wo[i][j] += dAO[t][i] * ctx[t][j];
+        dCtx[t][j] += model.Wo[i][j] * dAO[t][i];
+      }
+  }
+  var dQ = [], dK = [], dV = [];
+  for (var t = 0; t < T; t++) { dQ.push(new Float64Array(dim)); dK.push(new Float64Array(dim)); dV.push(new Float64Array(dim)); }
+  for (var i = 0; i < T; i++) {
+    var dW = new Float64Array(i + 1);
+    for (var j = 0; j <= i; j++) { dW[j] = dot(dCtx[i], V[j]); for (var d = 0; d < dim; d++) dV[j][d] += attnW[i][j] * dCtx[i][d]; }
+    var ws = 0; for (var j = 0; j <= i; j++) ws += attnW[i][j] * dW[j];
+    for (var j = 0; j <= i; j++) { var ds = attnW[i][j] * (dW[j] - ws) / sqrtD; for (var d = 0; d < dim; d++) { dQ[i][d] += ds * K[j][d]; dK[j][d] += ds * Q[i][d]; } }
+  }
+  for (var t = 0; t < T; t++)
+    for (var i = 0; i < dim; i++)
+      for (var j = 0; j < dim; j++) {
+        g.Wq[i][j] += dQ[t][i] * emb[t][j]; g.Wk[i][j] += dK[t][i] * emb[t][j]; g.Wv[i][j] += dV[t][i] * emb[t][j];
+        dEmb[t][j] += model.Wq[i][j] * dQ[t][i] + model.Wk[i][j] * dK[t][i] + model.Wv[i][j] * dV[t][i];
+      }
+  for (var t = 0; t < T; t++)
+    for (var d = 0; d < dim; d++) {
+      g.tok_emb[tokens[t]][d] += dEmb[t][d];
+      g.pos_emb[t][d] += dEmb[t][d];
+    }
+  return g;
+}
+
+function crossEntropyLoss(probs, target) {
+  return -Math.log(Math.max(probs[target], 1e-12));
+}
+
+function numericalGradient(model, input, target, paramName, i, j, epsilon) {
+  epsilon = epsilon || 1e-5;
+  var param = model[paramName];
+  var isMatrix = Array.isArray(param) || (param[0] && param[0].length !== undefined);
+  var original;
+  if (isMatrix) { original = param[i][j]; param[i][j] = original + epsilon; }
+  else { original = param[i]; param[i] = original + epsilon; }
+  var lossPlus = crossEntropyLoss(forward(model, input).probs, target);
+  if (isMatrix) { param[i][j] = original - epsilon; } else { param[i] = original - epsilon; }
+  var lossMinus = crossEntropyLoss(forward(model, input).probs, target);
+  if (isMatrix) { param[i][j] = original; } else { param[i] = original; }
+  return (lossPlus - lossMinus) / (2 * epsilon);
+}
+
+// --- shared/optimizer.js ---
+// Tiny Transformer — Adam optimizer and training utilities
+
+
+function createAdam(model) {
+  var state = {};
+  for (var n of MATRIX_PARAMS) {
+    state[n] = { m: zeros(model[n].length, model[n][0].length), v: zeros(model[n].length, model[n][0].length) };
+  }
+  for (var n of BIAS_PARAMS) {
+    state[n] = { m: new Float64Array(model[n].length), v: new Float64Array(model[n].length) };
+  }
+  state.t = 0;
+  return state;
+}
+
+function clipGrad(v) { return v > 5 ? 5 : v < -5 ? -5 : v; }
+
+function adamStep(model, grads, adam, lr, beta1, beta2, eps) {
+  beta1 = beta1 || 0.9; beta2 = beta2 || 0.999; eps = eps || 1e-8;
+  adam.t++;
+  var bc1 = 1 - Math.pow(beta1, adam.t);
+  var bc2 = 1 - Math.pow(beta2, adam.t);
+  for (var n of MATRIX_PARAMS) {
+    var p = model[n], g = grads[n], am = adam[n].m, av = adam[n].v;
+    for (var i = 0; i < p.length; i++)
+      for (var j = 0; j < p[i].length; j++) {
+        var gc = clipGrad(g[i][j]);
+        am[i][j] = beta1 * am[i][j] + (1 - beta1) * gc;
+        av[i][j] = beta2 * av[i][j] + (1 - beta2) * gc * gc;
+        p[i][j] -= lr * (am[i][j] / bc1) / (Math.sqrt(av[i][j] / bc2) + eps);
+      }
+  }
+  for (var n of BIAS_PARAMS) {
+    var p = model[n], g = grads[n], am = adam[n].m, av = adam[n].v;
+    for (var i = 0; i < p.length; i++) {
+      var gc = clipGrad(g[i]);
+      am[i] = beta1 * am[i] + (1 - beta1) * gc;
+      av[i] = beta2 * av[i] + (1 - beta2) * gc * gc;
+      p[i] -= lr * (am[i] / bc1) / (Math.sqrt(av[i] / bc2) + eps);
+    }
+  }
+}
+
+function trainStep(model, adam, input, target, lr) {
+  var result = forward(model, input);
+  var loss = -Math.log(Math.max(result.probs[target], 1e-12));
+  if (loss > 20 || isNaN(loss)) return { loss: loss, probs: null, cache: null };
+  var g = backward(model, result.cache, target);
+  adamStep(model, g, adam, lr);
+  return { loss: loss, probs: result.probs, cache: result.cache };
+}
+
+// --- shared/ui.js ---
+// Tiny Transformer — Shared UI helpers (heatmap, texture rendering, sampling)
+
+
+function heatColor(v) {
+  var t = (Math.max(-1, Math.min(1, v)) + 1) / 2;
+  var r = t < 0.5 ? 0 : (t - 0.5) * 2 * 255;
+  var g = t < 0.25 ? t * 4 * 255 : t < 0.75 ? 255 : (1 - t) * 4 * 255;
+  var b = t < 0.5 ? (0.5 - t) * 2 * 255 : 0;
+  return [Math.round(Math.max(0, Math.min(255, r))), Math.round(Math.max(0, Math.min(255, g))), Math.round(Math.max(0, Math.min(255, b)))];
+}
+
+function renderTexture(canvas, data, rows, cols, trail, trailBuf) {
+  if (!canvas) return;
+  var cellSize = Math.max(2, Math.min(Math.floor(156 / cols), Math.floor(90 / rows), 10));
+  var w = cols * cellSize, h = rows * cellSize;
+  canvas.width = w;
+  canvas.height = h;
+  var ctx2d = canvas.getContext('2d');
+  var img = ctx2d.createImageData(w, h);
+  var min = Infinity, max = -Infinity;
+  for (var i = 0; i < rows; i++) for (var j = 0; j < cols; j++) {
+    var v = data[i][j];
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  var range = max - min || 1;
+  for (var i = 0; i < rows; i++) for (var j = 0; j < cols; j++) {
+    var norm = ((data[i][j] - min) / range) * 2 - 1;
+    if (trail && trailBuf) {
+      var idx = i * cols + j;
+      norm = trailBuf[idx] * 0.7 + norm * 0.3;
+      trailBuf[idx] = norm;
+    }
+    var c = heatColor(norm);
+    for (var dy = 0; dy < cellSize; dy++) for (var dx = 0; dx < cellSize; dx++) {
+      var px = ((i * cellSize + dy) * w + j * cellSize + dx) * 4;
+      img.data[px] = c[0]; img.data[px + 1] = c[1]; img.data[px + 2] = c[2]; img.data[px + 3] = 255;
+    }
+  }
+  ctx2d.putImageData(img, 0, 0);
+}
+
+function sampleWithTemp(logits, temp) {
+  if (temp <= 0.01) {
+    var best = 0;
+    for (var i = 1; i < logits.length; i++) if (logits[i] > logits[best]) best = i;
+    return best;
+  }
+  var scaled = new Float64Array(logits.length);
+  for (var i = 0; i < logits.length; i++) scaled[i] = logits[i] / temp;
+  var probs = softmax(scaled);
+  var r = Math.random(), cum = 0;
+  for (var i = 0; i < probs.length; i++) { cum += probs[i]; if (r < cum) return i; }
+  return probs.length - 1;
+}
+
+// --- drums/data.js ---
+// Drums Demo — Training data generation
+// Vocabulary: 16 tokens = 4-bit bitmask of drum hits
+//   bit 0 = kick, bit 1 = snare, bit 2 = closed hat, bit 3 = open hat
+// Patterns are 16 or 32 steps (standard bar/2-bar loops)
+
+var DRUM_NAMES = ['kick', 'snare', 'hat', 'open'];
+
+// Common drum patterns (hand-crafted + procedural)
+function generateDrumPatterns(count) {
+  count = count || 30;
+  var patterns = [];
+
+  // --- Hand-crafted classic patterns ---
+  // Basic 4-on-the-floor (house/disco)
+  // K on 1,5,9,13  S on 5,13  H on every step
+  patterns.push(makePattern([
+    5,4,4,4, 7,4,4,4, 5,4,4,4, 7,4,4,4
+  ]));
+
+  // Standard rock beat
+  // K on 1,9  S on 5,13  H on odd steps
+  patterns.push(makePattern([
+    5,4,0,4, 6,4,0,4, 5,4,0,4, 6,4,0,4
+  ]));
+
+  // Funk pattern
+  patterns.push(makePattern([
+    5,0,4,1, 6,0,4,0, 1,4,5,0, 6,4,0,4
+  ]));
+
+  // Reggaeton / dembow
+  patterns.push(makePattern([
+    5,0,4,2, 5,0,4,2, 5,0,4,2, 5,0,4,2
+  ]));
+
+  // Bossa nova feel
+  patterns.push(makePattern([
+    5,4,0,4, 4,6,4,0, 5,4,0,4, 0,6,4,4
+  ]));
+
+  // Breakbeat
+  patterns.push(makePattern([
+    5,0,4,0, 6,0,0,5, 0,4,6,0, 4,1,4,0
+  ]));
+
+  // Hi-hat focused (trap)
+  patterns.push(makePattern([
+    5,4,4,4, 6,4,4,4, 5,4,4,4, 6,4,4,4
+  ]));
+  patterns.push(makePattern([
+    1,4,4,4, 2,4,4,4, 1,4,4,8, 2,4,4,4
+  ]));
+
+  // Fill the rest with procedural patterns
+  while (patterns.length < count) {
+    patterns.push(generateProceduralPattern());
+  }
+
+  return patterns;
+}
+
+function makePattern(steps) {
+  // Repeat to make a longer sequence for window sampling
+  var rep = [];
+  for (var r = 0; r < 4; r++) for (var i = 0; i < steps.length; i++) rep.push(steps[i]);
+  return rep;
+}
+
+function generateProceduralPattern() {
+  var len = 16;
+  var steps = new Array(len).fill(0);
+
+  // Kick: mostly on beat (positions 0, 4, 8, 12) with some variation
+  var kickStyle = Math.floor(Math.random() * 3);
+  if (kickStyle === 0) { // 4-on-the-floor
+    for (var i = 0; i < len; i += 4) steps[i] |= 1;
+  } else if (kickStyle === 1) { // 1 and 3
+    steps[0] |= 1; steps[8] |= 1;
+    if (Math.random() < 0.5) steps[6] |= 1; // ghost kick
+  } else { // syncopated
+    steps[0] |= 1; steps[3] |= 1; steps[8] |= 1; steps[11] |= 1;
+  }
+
+  // Snare: typically on 2 and 4 (positions 4, 12)
+  var snareStyle = Math.floor(Math.random() * 3);
+  if (snareStyle === 0) { // standard backbeat
+    steps[4] |= 2; steps[12] |= 2;
+  } else if (snareStyle === 1) { // with ghost notes
+    steps[4] |= 2; steps[12] |= 2;
+    if (Math.random() < 0.6) steps[10] |= 2;
+  } else { // offbeat snare
+    steps[2] |= 2; steps[6] |= 2; steps[10] |= 2; steps[14] |= 2;
+  }
+
+  // Hi-hat: dense or sparse
+  var hatStyle = Math.floor(Math.random() * 3);
+  if (hatStyle === 0) { // 8th notes
+    for (var i = 0; i < len; i += 2) steps[i] |= 4;
+  } else if (hatStyle === 1) { // 16th notes
+    for (var i = 0; i < len; i++) steps[i] |= 4;
+  } else { // sparse/offbeat
+    for (var i = 1; i < len; i += 2) steps[i] |= 4;
+  }
+
+  // Open hat: occasional (replace some closed hats)
+  if (Math.random() < 0.5) {
+    var openPos = [Math.floor(Math.random() * 4) * 4 + 2]; // off-beat position
+    if (Math.random() < 0.3) openPos.push(Math.floor(Math.random() * 4) * 4 + 3);
+    for (var p of openPos) {
+      if (p < len) { steps[p] = (steps[p] & ~4) | 8; } // replace closed with open
+    }
+  }
+
+  return makePattern(steps);
+}
+
+function sampleExample(patterns, seqLen) {
+  seqLen = seqLen || 24;
+  var p = patterns[Math.floor(Math.random() * patterns.length)];
+  var st = Math.floor(Math.random() * (p.length - 3));
+  var wl = 3 + Math.floor(Math.random() * (Math.min(seqLen, p.length - st - 1) - 2));
+  return { input: p.slice(st, st + wl), target: p[st + wl] };
+}
+
+// Drums Transformer Demo — React component
+// 16 tokens = 4-bit bitmask: kick(1) snare(2) closed-hat(4) open-hat(8)
+
+const { useState, useRef, useEffect, useCallback, useMemo } = React;
+
+var DRUM_LABELS = ['K', 'S', 'H', 'O'];
+var DRUM_COLORS = ['#e44', '#4af', '#4e4', '#fa4'];
+var DRUM_BITS = [1, 2, 4, 8];
+
+// Web Audio synthesis
+function createDrumSynth() {
+  var ctx = null;
+  function getCtx() {
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    return ctx;
+  }
+  return {
+    play: function(token) {
+      var ac = getCtx();
+      var now = ac.currentTime;
+      if (token & 1) { // kick
+        var osc = ac.createOscillator(); var g = ac.createGain();
+        osc.type = 'sine'; osc.frequency.setValueAtTime(150, now); osc.frequency.exponentialRampToValueAtTime(40, now + 0.12);
+        g.gain.setValueAtTime(0.8, now); g.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
+        osc.connect(g); g.connect(ac.destination); osc.start(now); osc.stop(now + 0.2);
+      }
+      if (token & 2) { // snare
+        var bufSize = ac.sampleRate * 0.1; var buf = ac.createBuffer(1, bufSize, ac.sampleRate);
+        var d = buf.getChannelData(0); for (var i = 0; i < bufSize; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / bufSize, 3);
+        var src = ac.createBufferSource(); var g = ac.createGain();
+        src.buffer = buf; g.gain.setValueAtTime(0.6, now); g.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+        src.connect(g); g.connect(ac.destination); src.start(now);
+        // Snare body tone
+        var osc = ac.createOscillator(); var g2 = ac.createGain();
+        osc.type = 'triangle'; osc.frequency.setValueAtTime(200, now);
+        g2.gain.setValueAtTime(0.3, now); g2.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+        osc.connect(g2); g2.connect(ac.destination); osc.start(now); osc.stop(now + 0.08);
+      }
+      if (token & 4) { // closed hat
+        var bufSize = ac.sampleRate * 0.04; var buf = ac.createBuffer(1, bufSize, ac.sampleRate);
+        var d = buf.getChannelData(0); for (var i = 0; i < bufSize; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / bufSize, 6);
+        var src = ac.createBufferSource(); var hp = ac.createBiquadFilter(); var g = ac.createGain();
+        src.buffer = buf; hp.type = 'highpass'; hp.frequency.value = 7000;
+        g.gain.setValueAtTime(0.3, now); g.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
+        src.connect(hp); hp.connect(g); g.connect(ac.destination); src.start(now);
+      }
+      if (token & 8) { // open hat
+        var bufSize = ac.sampleRate * 0.15; var buf = ac.createBuffer(1, bufSize, ac.sampleRate);
+        var d = buf.getChannelData(0); for (var i = 0; i < bufSize; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / bufSize, 2);
+        var src = ac.createBufferSource(); var hp = ac.createBiquadFilter(); var g = ac.createGain();
+        src.buffer = buf; hp.type = 'highpass'; hp.frequency.value = 6000;
+        g.gain.setValueAtTime(0.35, now); g.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+        src.connect(hp); hp.connect(g); g.connect(ac.destination); src.start(now);
+      }
+    }
+  };
+}
+
+function DrumTransformer() {
+  var modelRef = useRef(null);
+  var adamRef = useRef(null);
+  var patternsRef = useRef(null);
+  var epochRef = useRef(0);
+  var trainIntervalRef = useRef(null);
+  var playIntervalRef = useRef(null);
+  var synthRef = useRef(null);
+  var trailBufsRef = useRef({});
+  var textureCanvasRefs = useRef({});
+
+  var [phase, setPhase] = useState('EDIT'); // EDIT | IDLE | PLAYING | PAUSED
+  var [isTraining, setIsTraining] = useState(false);
+  var [seed, setSeed] = useState([]);
+  var [generated, setGenerated] = useState([]);
+  var [loss, setLoss] = useState(null);
+  var [epoch, setEpoch] = useState(0);
+  var [trail, setTrail] = useState(false);
+  var [renderTick, setRenderTick] = useState(0);
+  var lossHistoryRef = useRef([]);
+  var [lr, setLr] = useState(0.001);
+  var [dim, setDim] = useState(24);
+  var [temp, setTemp] = useState(0.0);
+  var [paramCount, setParamCount] = useState(0);
+  var [playHead, setPlayHead] = useState(-1);
+  var [bpm, setBpm] = useState(120);
+
+  useEffect(function() {
+    var m = createModel({ dim: dim });
+    modelRef.current = m;
+    adamRef.current = createAdam(m);
+    patternsRef.current = generateDrumPatterns(30);
+    synthRef.current = createDrumSynth();
+    setParamCount(countParams(m));
+  }, []);
+
+  // --- Seed editing: toggle drum bits in a 16-step grid ---
+  var [editSteps, setEditSteps] = useState(function() { return new Array(16).fill(0); });
+
+  var toggleBit = useCallback(function(step, bit) {
+    if (phase !== 'EDIT') return;
+    setEditSteps(function(prev) {
+      var next = prev.slice();
+      next[step] ^= bit;
+      return next;
+    });
+  }, [phase]);
+
+  var confirmSeed = useCallback(function() {
+    var s = editSteps.filter(function(_, i) { return i < 16; });
+    if (s.length < 3) return;
+    setSeed(s);
+    setGenerated([]);
+    setPhase('IDLE');
+  }, [editSteps]);
+
+  // --- Training ---
+  var lrRef = useRef(lr); lrRef.current = lr;
+
+  var startTraining = useCallback(function() {
+    if (trainIntervalRef.current) return;
+    setIsTraining(true);
+    trainIntervalRef.current = setInterval(function() {
+      var model = modelRef.current, adam = adamRef.current, patterns = patternsRef.current;
+      if (!model || !adam || !patterns) return;
+      var totalLoss = 0, count = 0;
+      for (var i = 0; i < 24; i++) {
+        var s = sampleExample(patterns, model.seqLen);
+        var r = trainStep(model, adam, s.input, s.target, lrRef.current);
+        if (!isNaN(r.loss) && r.loss <= 20) { totalLoss += r.loss; count++; }
+      }
+      epochRef.current++;
+      var avgLoss = count > 0 ? totalLoss / count : null;
+      if (avgLoss !== null) lossHistoryRef.current.push(avgLoss);
+      setLoss(avgLoss); setEpoch(epochRef.current); setRenderTick(function(n) { return n + 1; });
+    }, 50);
+  }, []);
+
+  var stopTraining = useCallback(function() {
+    if (trainIntervalRef.current) { clearInterval(trainIntervalRef.current); trainIntervalRef.current = null; }
+    setIsTraining(false);
+  }, []);
+
+  // --- Generation ---
+  var tempRef = useRef(temp); tempRef.current = temp;
+  var seedRef = useRef(seed); seedRef.current = seed;
+
+  var generateOne = useCallback(function() {
+    var model = modelRef.current; if (!model) return null;
+    var currentSeed = seedRef.current;
+    var next = null;
+    setGenerated(function(prev) {
+      var full = currentSeed.concat(prev);
+      var context = full.slice(-model.seqLen);
+      var result = forward(model, context);
+      next = sampleWithTemp(result.logits, tempRef.current);
+      return prev.concat([next]);
+    });
+    setRenderTick(function(n) { return n + 1; });
+    return next;
+  }, []);
+
+  // --- Playback with audio ---
+  var bpmRef = useRef(bpm); bpmRef.current = bpm;
+
+  var startPlaying = useCallback(function() {
+    if (playIntervalRef.current) return;
+    setPhase('PLAYING');
+    var stepIndex = 0;
+    var allSteps = seedRef.current.concat([]);
+    // Pre-generate enough steps
+    var model = modelRef.current;
+    if (model) {
+      var genSoFar = [];
+      setGenerated(function(prev) { genSoFar = prev.slice(); return prev; });
+      allSteps = seedRef.current.concat(genSoFar);
+    }
+
+    function tick() {
+      setGenerated(function(prev) {
+        var full = seedRef.current.concat(prev);
+        // Generate more if we need them
+        while (full.length <= stepIndex + seedRef.current.length) {
+          var model = modelRef.current; if (!model) break;
+          var context = full.slice(-model.seqLen);
+          var result = forward(model, context);
+          var next = sampleWithTemp(result.logits, tempRef.current);
+          prev = prev.concat([next]);
+          full = seedRef.current.concat(prev);
+        }
+        // Play current step
+        var idx = stepIndex % full.length;
+        var token = full[idx];
+        if (synthRef.current && token > 0) synthRef.current.play(token);
+        setPlayHead(idx);
+        stepIndex++;
+        return prev;
+      });
+    }
+
+    tick(); // play first step immediately
+    var ms = 60000 / bpmRef.current / 4; // 16th note interval
+    playIntervalRef.current = setInterval(function() {
+      var ms2 = 60000 / bpmRef.current / 4;
+      tick();
+      // If BPM changed, restart interval
+      if (Math.abs(ms2 - ms) > 1) {
+        clearInterval(playIntervalRef.current);
+        ms = ms2;
+        playIntervalRef.current = setInterval(tick, ms);
+      }
+    }, ms);
+  }, []);
+
+  var stopPlaying = useCallback(function() {
+    if (playIntervalRef.current) { clearInterval(playIntervalRef.current); playIntervalRef.current = null; }
+    setPlayHead(-1);
+  }, []);
+
+  var handlePlay = useCallback(function() {
+    if (phase === 'PLAYING') { stopPlaying(); setPhase('PAUSED'); }
+    else { startPlaying(); }
+  }, [phase, startPlaying, stopPlaying]);
+
+  var handleRewind = useCallback(function() {
+    stopPlaying(); setGenerated([]); setPhase('IDLE'); setPlayHead(-1);
+  }, [stopPlaying]);
+
+  var handleClear = useCallback(function() {
+    stopPlaying(); setSeed([]); setGenerated([]);
+    setEditSteps(new Array(16).fill(0)); setPhase('EDIT'); setPlayHead(-1);
+  }, [stopPlaying]);
+
+  var handleReset = useCallback(function() {
+    stopPlaying(); stopTraining();
+    var m = createModel({ dim: dim }); modelRef.current = m; adamRef.current = createAdam(m);
+    patternsRef.current = generateDrumPatterns(30); epochRef.current = 0;
+    trailBufsRef.current = {}; lossHistoryRef.current = [];
+    setSeed([]); setGenerated([]); setEditSteps(new Array(16).fill(0));
+    setLoss(null); setEpoch(0); setParamCount(countParams(m)); setPhase('EDIT'); setPlayHead(-1);
+  }, [stopPlaying, stopTraining, dim]);
+
+  useEffect(function() { return function() { stopPlaying(); stopTraining(); }; }, [stopPlaying, stopTraining]);
+
+  // --- Textures ---
+  var textures = useMemo(function() {
+    var m = modelRef.current; if (!m) return [];
+    var d = m.dim, fd = m.ffnDim;
+    return [
+      { name: 'tok embed', data: m.tok_emb, rows: m.numTokens, cols: d },
+      { name: 'pos embed', data: m.pos_emb, rows: m.seqLen, cols: d },
+      { name: 'W_query', data: m.Wq, rows: d, cols: d }, { name: 'W_key', data: m.Wk, rows: d, cols: d },
+      { name: 'W_value', data: m.Wv, rows: d, cols: d }, { name: 'W_out', data: m.Wo, rows: d, cols: d },
+      { name: 'FFN up', data: m.ffn_up, rows: fd, cols: d }, { name: 'FFN down', data: m.ffn_down, rows: d, cols: fd },
+      { name: 'readout', data: m.out_proj, rows: m.numTokens, cols: d },
+    ];
+  }, [epoch, generated.length, renderTick]);
+
+  useEffect(function() {
+    for (var tex of textures) {
+      var canvas = textureCanvasRefs.current[tex.name]; if (!canvas) continue;
+      if (!trailBufsRef.current[tex.name]) trailBufsRef.current[tex.name] = new Float64Array(tex.rows * tex.cols);
+      renderTexture(canvas, tex.data, tex.rows, tex.cols, trail, trail ? trailBufsRef.current[tex.name] : null);
+    }
+  }, [textures, trail]);
+
+  // --- Render ---
+  var full = seed.concat(generated);
+  var btnStyle = function(active, disabled) {
+    return { padding: '6px 10px', border: 'none', borderRadius: 4, cursor: disabled ? 'default' : 'pointer', fontSize: 13, fontFamily: 'monospace', fontWeight: 600, background: active ? '#c22' : disabled ? '#333' : '#444', color: disabled ? '#666' : '#eee', opacity: disabled ? 0.5 : 1 };
+  };
+
+  // Loss canvas
+  var lossCanvasRef = useRef(null);
+  useEffect(function() {
+    var canvas = lossCanvasRef.current; if (!canvas) return;
+    var ctx2d = canvas.getContext('2d');
+    var w = canvas.width, h = canvas.height;
+    ctx2d.fillStyle = '#111'; ctx2d.fillRect(0, 0, w, h);
+    var history = lossHistoryRef.current;
+    if (history.length < 2) {
+      ctx2d.fillStyle = 'rgba(255,255,255,0.3)'; ctx2d.textAlign = 'center'; ctx2d.font = '12px monospace';
+      ctx2d.fillText(isTraining ? 'training...' : 'tap grid below to create a beat', w / 2, h / 2);
+      return;
+    }
+    var maxL = Math.max.apply(null, history.slice(0, 20)), minL = Math.min.apply(null, history);
+    var yR = Math.max(maxL - minL, 0.01);
+    var pad = { top: 12, bottom: 16, left: 40, right: 8 };
+    var gw = w - pad.left - pad.right, gh = h - pad.top - pad.bottom;
+    ctx2d.strokeStyle = '#f84'; ctx2d.lineWidth = 1.5; ctx2d.beginPath();
+    for (var i = 0; i < history.length; i++) {
+      var x = pad.left + (i / (history.length - 1)) * gw;
+      var y = pad.top + ((maxL - history[i]) / yR) * gh;
+      if (i === 0) ctx2d.moveTo(x, y); else ctx2d.lineTo(x, y);
+    }
+    ctx2d.stroke();
+    ctx2d.fillStyle = '#f84'; ctx2d.font = '10px monospace'; ctx2d.textAlign = 'left';
+    ctx2d.fillText('loss ' + history[history.length - 1].toFixed(4), pad.left + 4, pad.top - 2);
+    ctx2d.fillStyle = '#666'; ctx2d.textAlign = 'center'; ctx2d.fillText('ep ' + history.length, w / 2, h - 2);
+  }, [epoch, isTraining]);
+
+  // Resize loss canvas
+  useEffect(function() {
+    var canvas = lossCanvasRef.current; if (!canvas) return;
+    var resize = function() { var p = canvas.parentElement; if (p) { canvas.width = p.clientWidth; canvas.height = p.clientHeight; } };
+    resize(); var ro = new ResizeObserver(resize); ro.observe(canvas.parentElement);
+    return function() { ro.disconnect(); };
+  }, []);
+
+  return (
+    <div style={{ background: '#0a0a0a', color: '#eee', fontFamily: 'monospace', minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
+      {/* Header */}
+      <div style={{ padding: '8px 12px', borderBottom: '1px solid #333', fontSize: 13, color: '#888' }}>
+        <span style={{ color: '#eee', fontWeight: 700 }}>drum.transformer</span>
+        {' '}{paramCount.toLocaleString()} params · 16 combos · {dim}d
+      </div>
+
+      {/* Toolbar */}
+      <div style={{ padding: '6px 12px', display: 'flex', gap: 6, flexWrap: 'wrap', borderBottom: '1px solid #333', alignItems: 'center' }}>
+        <button style={btnStyle(isTraining)} onClick={isTraining ? stopTraining : startTraining}>{isTraining ? '■ Stop' : '⟳ Train'}</button>
+        {phase === 'EDIT' ? (
+          <button style={btnStyle(false, editSteps.every(function(s) { return s === 0; }))} onClick={confirmSeed} disabled={editSteps.every(function(s) { return s === 0; })}>✓ Set Seed</button>
+        ) : (
+          <button style={btnStyle(phase === 'PLAYING')} onClick={handlePlay}>{phase === 'PLAYING' ? '❚❚ Pause' : '▶ Play'}</button>
+        )}
+        <button style={btnStyle(false, phase === 'EDIT')} onClick={handleRewind} disabled={phase === 'EDIT'}>↺ Rewind</button>
+        <button style={btnStyle()} onClick={handleClear}>✕ Clear</button>
+        <div style={{ flex: 1 }} />
+        <button style={{ ...btnStyle(), background: '#622' }} onClick={handleReset}>RESET</button>
+      </div>
+
+      {/* Status bar */}
+      <div style={{ padding: '6px 12px', display: 'flex', gap: 10, alignItems: 'center', borderBottom: '1px solid #333', fontSize: 11, flexWrap: 'wrap' }}>
+        <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
+          <span style={{ width: 10, height: 10, borderRadius: '50%', border: '2px solid #888', background: trail ? '#4f4' : 'transparent', display: 'inline-block' }} onClick={function() { setTrail(function(t) { return !t; }); }} />TRAIL
+        </label>
+        <span>dim</span><input type="range" min={8} max={48} step={4} value={dim} onChange={function(e) { setDim(+e.target.value); }} disabled={isTraining || phase !== 'EDIT'} style={{ width: 50 }} /><span>{dim}</span>
+        <span style={{ color: '#555' }}>|</span>
+        <span>lr</span><input type="range" min={-4} max={-1} step={0.1} value={Math.log10(lr)} onChange={function(e) { setLr(Math.round(Math.pow(10, +e.target.value) * 10000) / 10000); }} style={{ width: 50 }} /><span>{lr}</span>
+        <span style={{ color: '#555' }}>|</span>
+        <span>temp</span><input type="range" min={0} max={1.5} step={0.05} value={temp} onChange={function(e) { setTemp(+e.target.value); }} style={{ width: 50 }} /><span>{temp.toFixed(2)}</span>
+        <span style={{ color: '#555' }}>|</span>
+        <span>bpm</span><input type="range" min={60} max={200} step={5} value={bpm} onChange={function(e) { setBpm(+e.target.value); }} style={{ width: 50 }} /><span>{bpm}</span>
+        <span style={{ color: '#555' }}>|</span>
+        <span>ep {epoch}</span><span>loss {loss !== null ? loss.toFixed(4) : '—'}</span><span>{generated.length} gen</span>
+      </div>
+
+      {/* Loss graph */}
+      <div style={{ height: 60, background: '#111', borderBottom: '1px solid #222' }}>
+        <canvas ref={lossCanvasRef} style={{ width: '100%', height: '100%' }} />
+      </div>
+
+      {/* Beat Grid */}
+      <div style={{ padding: '12px', overflowX: 'auto' }}>
+        {phase === 'EDIT' ? (
+          /* Editing grid: 4 rows (K,S,H,O) x 16 steps */
+          <div>
+            <div style={{ fontSize: 10, color: '#666', marginBottom: 6 }}>tap cells to toggle · then press "Set Seed"</div>
+            <div style={{ display: 'flex', gap: 2 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginRight: 4 }}>
+                {DRUM_LABELS.map(function(label, row) { return <div key={row} style={{ height: 28, display: 'flex', alignItems: 'center', fontSize: 11, color: DRUM_COLORS[row], width: 16 }}>{label}</div>; })}
+              </div>
+              {editSteps.map(function(token, col) {
+                return <div key={col} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  {DRUM_BITS.map(function(bit, row) {
+                    var on = (token & bit) !== 0;
+                    return <div key={row} onClick={function() { toggleBit(col, bit); }}
+                      style={{ width: 28, height: 28, borderRadius: 3, cursor: 'pointer', border: '1px solid #333',
+                        background: on ? DRUM_COLORS[row] : (col % 4 === 0 ? '#1a1a1a' : '#111'),
+                        opacity: on ? 1 : 0.6 }} />;
+                  })}
+                </div>;
+              })}
+            </div>
+          </div>
+        ) : (
+          /* Playback grid: show seed (white borders) + generated (colored borders) */
+          <div style={{ overflowX: 'auto' }}>
+            <div style={{ display: 'flex', gap: 1, minWidth: 'min-content' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 1, marginRight: 4, flexShrink: 0 }}>
+                {DRUM_LABELS.map(function(label, row) { return <div key={row} style={{ height: 22, display: 'flex', alignItems: 'center', fontSize: 10, color: DRUM_COLORS[row], width: 16 }}>{label}</div>; })}
+              </div>
+              {full.map(function(token, col) {
+                var isSeed = col < seed.length;
+                var isHead = col === playHead;
+                return <div key={col} style={{ display: 'flex', flexDirection: 'column', gap: 1, flexShrink: 0 }}>
+                  {DRUM_BITS.map(function(bit, row) {
+                    var on = (token & bit) !== 0;
+                    return <div key={row} style={{
+                      width: 22, height: 22, borderRadius: 2,
+                      border: isHead ? '2px solid #fff' : isSeed ? '1px solid #555' : '1px solid #333',
+                      background: on ? DRUM_COLORS[row] : '#111',
+                      opacity: on ? 1 : 0.3
+                    }} />;
+                  })}
+                </div>;
+              })}
+            </div>
+            {seed.length > 0 && generated.length > 0 && (
+              <div style={{ fontSize: 10, color: '#666', marginTop: 4 }}>
+                <span style={{ color: '#888' }}>seed ({seed.length})</span> | <span style={{ color: '#4f4' }}>generated ({generated.length})</span>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Texture Panel */}
+      <div style={{ flex: 1, overflow: 'auto', padding: 8, borderTop: '1px solid #222' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 8 }}>
+          {textures.map(function(tex) {
+            return <div key={tex.name} style={{ textAlign: 'center' }}>
+              <canvas ref={function(el) { if (el) textureCanvasRefs.current[tex.name] = el; }} style={{ imageRendering: 'pixelated', maxWidth: '100%' }} />
+              <div style={{ fontSize: 10, color: '#888', marginTop: 2 }}>{tex.name} {tex.rows}×{tex.cols}</div>
+            </div>;
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+    ReactDOM.createRoot(document.getElementById('root')).render(
+      React.createElement(createDrumSynth)
+    );
+  </script>
+</body>
+</html>
