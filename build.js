@@ -37,8 +37,9 @@ function buildDemo(demo) {
   let jsxCode = fs.readFileSync(path.join(demoDir, jsxFiles[0]), 'utf8');
   jsxCode = jsxCode.replace(/^import .*$/gm, '');
   jsxCode = jsxCode.replace(/^export default /gm, '');
-  const match = jsxCode.match(/^function\s+(\w+)/m);
-  const componentName = match ? match[1] : 'App';
+  // Find the main React component: last function with a PascalCase name
+  const allFuncs = [...jsxCode.matchAll(/^function\s+([A-Z]\w+)/gm)];
+  const componentName = allFuncs.length > 0 ? allFuncs[allFuncs.length - 1][1] : 'App';
   const title = demo.charAt(0).toUpperCase() + demo.slice(1) + ' Transformer';
 
   const html = `<!DOCTYPE html>
