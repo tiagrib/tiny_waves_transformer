@@ -2,11 +2,12 @@
 // and tests the full train → generate pipeline
 
 const {
-  createModel, forward, crossEntropyLoss, backward, trainStep,
-  generateWaves, sampleTrainingExample, numericalGradient,
-  softmax, gelu, geluDerivative,
-  NUM_TOKENS, EMBED_DIM, SEQ_LEN, FFN_DIM,
-} = require('../src/model.js');
+  createModel, forward, crossEntropyLoss, backward, numericalGradient,
+  softmax, gelu, geluDerivative, countParams,
+  createAdam, trainStep, heatColor,
+} = require('../shared/index.js');
+const { generateWaves, sampleExample: sampleTrainingExample } = require('../demos/waves/data.js');
+const NUM_TOKENS = 16, SEQ_LEN = 24;
 
 let passed = 0, failed = 0;
 function test(name, fn) {
@@ -19,8 +20,9 @@ console.log('=== Integration Tests ===\n');
 // Test 1: Full pipeline — train, then generate coherent continuation
 console.log('Pipeline: train 2000 ticks, then generate');
 test('training reduces loss and generation produces wave-like output', () => {
-  const model = createModel();
-  let waves = generateWaves(30);
+  const model = createModel({ dim: 12 });
+  const adam = createAdam(model);
+  const waves = generateWaves(30);
   let lastLoss = Infinity;
   const lossHistory = [];
 
@@ -28,11 +30,10 @@ test('training reduces loss and generation produces wave-like output', () => {
     let tl = 0, c = 0;
     for (let i = 0; i < 24; i++) {
       const { input, target } = sampleTrainingExample(waves);
-      const loss = trainStep(model, input, target, 0.01);
+      const { loss } = trainStep(model, adam, input, target, 0.001);
       if (!isNaN(loss) && loss <= 20) { tl += loss; c++; }
     }
     if (c > 0) { lastLoss = tl / c; lossHistory.push(lastLoss); }
-    if (tick % 300 === 0) waves = generateWaves(30);
   }
 
   const first50 = lossHistory.slice(0, 50).reduce((a, b) => a + b) / 50;
@@ -62,7 +63,7 @@ test('training reduces loss and generation produces wave-like output', () => {
 // Test 2: Verify model parameter shapes match spec
 console.log('\nParameter shapes:');
 test('all parameters have correct shapes', () => {
-  const model = createModel();
+  const model = createModel({ dim: 12 });
   const checks = [
     ['tok_emb', 16, 12], ['pos_emb', 24, 12],
     ['Wq', 12, 12], ['Wk', 12, 12], ['Wv', 12, 12], ['Wo', 12, 12],
@@ -79,12 +80,8 @@ test('all parameters have correct shapes', () => {
 
 // Test 3: Approximate param count
 test('total parameter count ≈ 2160', () => {
-  let total = 0;
-  const model = createModel();
-  for (const name of ['tok_emb', 'pos_emb', 'Wq', 'Wk', 'Wv', 'Wo', 'ffn_up', 'ffn_down', 'out_proj']) {
-    total += model[name].length * model[name][0].length;
-  }
-  total += model.ffn_up_bias.length + model.ffn_down_bias.length;
+  const model = createModel({ dim: 12 });
+  const total = countParams(model);
   console.log('    total params: ' + total);
   if (total !== 2160) throw new Error('Expected 2160 params, got ' + total);
 });
@@ -92,7 +89,7 @@ test('total parameter count ≈ 2160', () => {
 // Test 4: Generation determinism (greedy = no randomness)
 console.log('\nDeterminism:');
 test('greedy generation is deterministic', () => {
-  const model = createModel();
+  const model = createModel({ dim: 12 });
   const input = [5, 6, 7, 8];
   const { probs: p1 } = forward(model, input);
   const { probs: p2 } = forward(model, input);
@@ -132,13 +129,6 @@ test('quantizes raw points to tokens correctly', () => {
 // Test 6: Heatmap color function
 console.log('\nHeatmap colors:');
 test('heatColor produces correct range', () => {
-  function heatColor(v) {
-    const t = (Math.max(-1, Math.min(1, v)) + 1) / 2;
-    const r = t < 0.5 ? 0 : (t - 0.5) * 2 * 255;
-    const g = t < 0.25 ? t * 4 * 255 : t < 0.75 ? 255 : (1 - t) * 4 * 255;
-    const b = t < 0.5 ? (0.5 - t) * 2 * 255 : 0;
-    return [Math.round(Math.max(0, Math.min(255, r))), Math.round(Math.max(0, Math.min(255, g))), Math.round(Math.max(0, Math.min(255, b)))];
-  }
   // v=-1 → blue
   const blue = heatColor(-1);
   if (blue[2] < 200) throw new Error('v=-1 should be blue: ' + JSON.stringify(blue));
@@ -154,12 +144,13 @@ test('heatColor produces correct range', () => {
 // Test 7: Training performance (analytical backprop speed)
 console.log('\nPerformance:');
 test('24 training steps complete in < 200ms', () => {
-  const model = createModel();
+  const model = createModel({ dim: 12 });
+  const adam = createAdam(model);
   const waves = generateWaves(30);
   const start = performance.now();
   for (let i = 0; i < 24; i++) {
     const { input, target } = sampleTrainingExample(waves);
-    trainStep(model, input, target, 0.01);
+    trainStep(model, adam, input, target, 0.001);
   }
   const elapsed = performance.now() - start;
   console.log('    24 steps: ' + elapsed.toFixed(1) + 'ms');

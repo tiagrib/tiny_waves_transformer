@@ -1,10 +1,10 @@
 const assert = require('assert');
 const {
-  NUM_TOKENS, EMBED_DIM, SEQ_LEN, FFN_DIM,
   softmax, gelu, geluDerivative,
-  createModel, forward, crossEntropyLoss, backward,
-  generateWaves, sampleTrainingExample, numericalGradient,
-} = require('../src/model.js');
+  createModel, forward, crossEntropyLoss, backward, numericalGradient,
+} = require('../shared/index.js');
+const { generateWaves, sampleExample: sampleTrainingExample } = require('../demos/waves/data.js');
+const NUM_TOKENS = 16, SEQ_LEN = 24;
 
 let passed = 0;
 let failed = 0;
@@ -76,7 +76,7 @@ test('matches numerical derivative', () => {
 // --- Forward Pass ---
 console.log('\nForward Pass:');
 test('produces valid probability distribution', () => {
-  const model = createModel();
+  const model = createModel({ dim: 12 });
   const { probs } = forward(model, [0, 1, 2, 3]);
   assert(probs.length === NUM_TOKENS, `length=${probs.length}`);
   const sum = probs.reduce((a, b) => a + b, 0);
@@ -88,7 +88,7 @@ test('produces valid probability distribution', () => {
 });
 
 test('works with various sequence lengths', () => {
-  const model = createModel();
+  const model = createModel({ dim: 12 });
   for (const len of [1, 2, 5, 12, 24]) {
     const tokens = Array.from({ length: len }, (_, i) => i % 16);
     const { probs } = forward(model, tokens);
@@ -125,7 +125,7 @@ test('samples valid training examples', () => {
 console.log('\nGradient Verification (analytical vs numerical):');
 test('gradients match for all parameters', () => {
   // Use a fixed seed by creating a small model and fixed input
-  const model = createModel();
+  const model = createModel({ dim: 12 });
   const input = [5, 5, 5, 5];
   const target = 5;
 
@@ -186,7 +186,7 @@ test('gradients match for all parameters', () => {
 
 // Broader gradient check with random input
 test('gradients match for random input', () => {
-  const model = createModel();
+  const model = createModel({ dim: 12 });
   const input = [3, 7, 11, 2, 9];
   const target = 8;
 
